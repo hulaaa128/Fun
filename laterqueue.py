@@ -1441,6 +1441,7 @@ class Pet(QWidget):
         self._menu = self._build_menu()
         self._press_pos = None
         self._moved = False
+        self._single_click_pending = False
 
         # ---------- 动画状态 ----------
         self._t = 0.0            # 动画时钟（秒）
@@ -2232,12 +2233,22 @@ class Pet(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and getattr(self, "_click_candidate", False):
             self._click_candidate = False
-            self._bounce()         # 点一下先跳一下
-            self.toggle_bubble()   # 没拖动 = 单击，展开/收起队列
+            self._single_click_pending = True
+            # 双击会先经历一次单击 release；延迟确认，给 doubleClickEvent 取消机会。
+            QTimer.singleShot(QApplication.doubleClickInterval() + 30,
+                              self._commit_single_click)
+
+    def _commit_single_click(self):
+        if not self._single_click_pending:
+            return
+        self._single_click_pending = False
+        self._bounce()         # 点一下先跳一下
+        self.toggle_bubble()   # 没拖动 = 单击，展开/收起队列
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.LeftButton and self._is_pet_hit(e.position().toPoint()):
             self._click_candidate = False
+            self._single_click_pending = False
             self._menu.exec(e.globalPosition().toPoint())
             return
         e.ignore()
