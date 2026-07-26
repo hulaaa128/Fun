@@ -45,10 +45,10 @@ MENTIONS_FILE = os.path.join(DATA_DIR, "mentions.json")
 REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
 
 # 京ME「被@」监控：joyctl 读消息是纯只读，不会清掉京ME 的未读红点。
-# @我 检测靠 content 里的纯文本 "@<mention_name>"（京ME 在名字后跟空格）。
+# @我 检测优先看 joyctl 返回的结构化 @ 字段；没有结构化字段时再用文本兜底。
 # 监控群与检测姓名现在都存在 mentions.json，可在「管理监控群」里增删/修改；
-# 下面的 MENTION_NAME 仅作为 mention_name 的初始默认值。
-MENTION_NAME = "高润丁"             # @我 检测姓名的默认值（首次运行用）
+# 默认不写入任何个人姓名，首次使用时请在「管理监控群」里设置。
+MENTION_NAME = ""                   # @我 检测姓名默认空，避免源码携带个人信息
 POLL_INTERVAL_MS = 10 * 60 * 1000  # 轮询间隔默认值：10 分钟（可在菜单自定义）
 POLL_INTERVAL_MIN = 1              # 自定义间隔下限（分钟）：太短会频繁调 joyctl
 POLL_INTERVAL_MAX = 120            # 自定义间隔上限（分钟）
@@ -59,6 +59,7 @@ JOYCTL_TIMEOUT_MS = 90 * 1000      # 传给 joyctl 的内部读取超时
 POLL_SUBPROCESS_TIMEOUT = 120      # subprocess 外层超时（秒），须 > 内部超时
 # 偶发一次超时不报红：连续 N 次失败才在面板显示⚠，成功即清零。
 FAIL_ALERT_THRESHOLD = 2
+POLL_BACKOFF_MAX_MIN = 60            # 连续失败时退避轮询，最多放慢到 60 分钟
 DISMISSED_KEEP = 500               # dismissed_keys 最多保留条数，防无限增长
 DONE_KEEP_DAYS = 14                # 已完成记录保留天数：超期在加载时清掉，防 queue.json 无限增长
 DONE_SHOW_MAX = 15                 # 「最近完成」区最多列出条数
@@ -136,6 +137,52 @@ def new_item(text):
 def compact_text(text):
     """把京ME多行消息压成一行；保留全文，只清理多余空白。"""
     return " ".join((text or "").split())
+
+
+def _extract_mention_values(value):
+    """从 joyctl 可能返回的结构化 @ 字段中提取姓名/ERP/userId 候选值。"""
+    vals = []
+    if value is None:
+        return vals
+    if isinstance(value, (str, int, float)):
+        vals.append(str(value))
+        return vals
+    if isinstance(value, dict):
+        for key in ("name", "displayName", "nick", "nickname", "erp", "userId", "username"):
+            if value.get(key):
+                vals.append(str(value.get(key)))
+        return vals
+    if isinstance(value, list):
+        for item in value:
+            vals.extend(_extract_mention_values(item))
+    return vals
+
+
+def is_mention_of_me(message, mention_name):
+    """判断一条京ME消息是否真的 @ 我：结构化字段优先，文本规则兜底。"""
+    name = compact_text(mention_name)
+    if not name or not isinstance(message, dict):
+        return False
+    if name.lower() in {"all", "所有人", "全体成员"}:
+        return False
+
+    for field in ("mentions", "atUsers", "mentionedUserIds", "mentionUsers", "atList"):
+        values = _extract_mention_values(message.get(field))
+        if values:
+            return any(compact_text(v) == name for v in values)
+
+    content = message.get("content") or ""
+    return re.search(rf"@{re.escape(name)}($|[\s\u2005，。！？、:：；;,.!?])", content) is not None
+
+
+def classify_poll_error(error_text):
+    """把 joyctl 错误分成用户可恢复的类型，用于面板提示与退避。"""
+    text = compact_text(error_text).lower()
+    if any(k in text for k in ("login", "登录", "unauthorized", "认证", "auth", "token", "cookie")):
+        return "login_expired"
+    if any(k in text for k in ("timeout", "timed out", "超时")):
+        return "timeout"
+    return "unknown"
 
 
 def load_state():
@@ -415,14 +462,13 @@ class MentionPoller(QObject):
         # 默认 json.loads 会抛异常导致整轮 @我 全丢，放宽即可。
         data = json.loads(proc.stdout, strict=False)
         messages = data.get("messages", []) if isinstance(data, dict) else []
-        needle = "@" + self.mention_name
         cands, latest = [], since
         for m in messages:
             content = (m.get("content") or "")
             sent_at = m.get("sentAt") or ""
             if sent_at and (latest is None or sent_at > latest):
                 latest = sent_at
-            if needle not in content:
+            if not is_mention_of_me(m, self.mention_name):
                 continue
             sender = m.get("sender") or "?"
             cands.append({
@@ -784,7 +830,13 @@ class QueueBubble(QWidget):
         # 偶发一次超时不亮红，退回显示淡色「上次检查」，不打扰。
         if self.app.monitor_group_ids():
             st = self.app.poll_status()
-            if getattr(self.app, "_checking", False):
+            if not self.app.mention_name():
+                tip = QLabel("先设置你的 @ 名称，我才能更准确地替你留意消息。")
+                tip.setObjectName("pollbad")
+                tip.setWordWrap(True)
+                tip.setMaximumWidth(300)
+                self.vbox.addWidget(tip)
+            elif getattr(self.app, "_checking", False):
                 # 用户点了「立即检查」：立刻显示，别让人以为没反应（joyctl 约十几秒）
                 chk = QLabel("正在检查 @我…")
                 chk.setObjectName("pollok")
@@ -810,6 +862,18 @@ class QueueBubble(QWidget):
                 note.setWordWrap(True)
                 note.setMaximumWidth(300)
                 self.vbox.addWidget(note)
+            elif st and st.get("login_expired"):
+                tip = QLabel("京 ME 登录状态可能已过期，请重新登录 joyctl 后我再继续为你留意。")
+                tip.setObjectName("pollbad")
+                tip.setWordWrap(True)
+                tip.setMaximumWidth(300)
+                self.vbox.addWidget(tip)
+
+                cmd = QLabel("joyctl login")
+                cmd.setObjectName("joyctlcmd")
+                cmd.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                cmd.setToolTip("在终端运行这条命令（可选中复制）")
+                self.vbox.addWidget(cmd)
             elif st and st.get("alert"):
                 warn = QLabel(f"⚠ 检查失败（{st.get('at', '')}）：{st.get('error', '')}")
                 warn.setObjectName("pollbad")
@@ -1035,7 +1099,7 @@ class GroupManagerDialog(QDialog):
         # @检测姓名一行
         namerow = QHBoxLayout()
         namerow.addWidget(QLabel("检测姓名："))
-        nv = QLabel(self.app.mention_name())
+        nv = QLabel(self.app.mention_name() or "未设置")
         nv.setObjectName("nameval")
         namerow.addWidget(nv)
         namerow.addStretch(1)
@@ -1111,7 +1175,7 @@ class GroupManagerDialog(QDialog):
         cur = self.app.mention_name()
         text, ok = SimpleInputDialog.get_text(
             self.app, "设置检测姓名", "检测「@这个名字」的消息：", text=cur)
-        if ok and text.strip():
+        if ok:
             self.app.mentions["mention_name"] = text.strip()
             save_mentions(self.app.mentions)
             self._reload()
@@ -1748,7 +1812,7 @@ class Pet(QWidget):
         return [g["id"] for g in self.monitor_groups() if g.get("id")]
 
     def mention_name(self):
-        return self.mentions.get("mention_name") or MENTION_NAME
+        return compact_text(self.mentions.get("mention_name") or MENTION_NAME)
 
     def poll_interval_min(self):
         """轮询间隔（分钟）：读配置，缺省 10，钳在 [MIN, MAX] 内。"""
@@ -1757,6 +1821,11 @@ class Pet(QWidget):
         except (TypeError, ValueError):
             v = 10
         return max(POLL_INTERVAL_MIN, min(v, POLL_INTERVAL_MAX))
+
+    def _restart_poll_timer(self, minutes):
+        """按指定分钟数重启轮询定时器，统一处理边界。"""
+        minutes = max(POLL_INTERVAL_MIN, min(int(minutes), POLL_INTERVAL_MAX))
+        self._poll_timer.start(minutes * 60 * 1000)
 
     # ---------- 定时提醒 ----------
     def _check_reminders(self):
@@ -1884,6 +1953,20 @@ class Pet(QWidget):
             if manual:
                 self._toast("还没加监控群，先去「管理监控群」加一个")
             return
+        if not self.mention_name():
+            self.mentions["poll_status"] = {
+                "ok": False,
+                "at": datetime.now().strftime("%m-%d %H:%M"),
+                "error": "未设置 @ 检测姓名",
+                "mention_name_missing": True,
+                "fail_count": 0,
+                "alert": True,
+            }
+            save_mentions(self.mentions)
+            if manual:
+                self._toast("先在「管理监控群」里设置你的 @ 名称")
+            self.refresh_ui()
+            return
         if manual:
             self._checking = True           # 面板显示「检查中…」
             self.refresh_ui()
@@ -1933,16 +2016,27 @@ class Pet(QWidget):
         elif errors:
             # 累计连续失败次数；达到阈值才在面板亮红，避免偶发一次超时就报警
             fail_count = int(prev.get("fail_count", 0)) + 1
+            error_text = "；".join(errors)[:300]
+            error_kind = classify_poll_error(error_text)
+            backoff_min = min(
+                POLL_BACKOFF_MAX_MIN,
+                self.poll_interval_min() * (2 ** min(max(fail_count - 1, 0), 4)),
+            )
             self.mentions["poll_status"] = {
-                "ok": False, "at": now, "error": "；".join(errors)[:300],
+                "ok": False, "at": now, "error": error_text,
+                "error_kind": error_kind,
+                "login_expired": error_kind == "login_expired",
                 "fail_count": fail_count,
+                "backoff_min": backoff_min,
                 "alert": fail_count >= FAIL_ALERT_THRESHOLD,
             }
+            self._restart_poll_timer(backoff_min)
         else:
             # 一旦成功，清零失败计数
             self.mentions["poll_status"] = {
                 "ok": True, "at": now, "error": "", "fail_count": 0,
                 "alert": False}
+            self._restart_poll_timer(self.poll_interval_min())
         save_mentions(self.mentions)
         if new_candidates:
             self._bounce()   # 有新的被@，跳一下提示
