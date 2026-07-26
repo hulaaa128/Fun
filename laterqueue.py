@@ -681,7 +681,7 @@ class QueueBubble(QWidget):
         pending = self.app.pending()
         cands = self.app.candidates()
 
-        # 被@候选区（仅在有候选时显示，排在「稍后处理」上方）
+        # 被@候选区（仅在有候选时显示，排在「待办事项」上方）
         if cands:
             mhead = QHBoxLayout()
             mhead.setSpacing(7)
@@ -696,7 +696,7 @@ class QueueBubble(QWidget):
             accept_all = QPushButton("全部收下")
             accept_all.setObjectName("acceptall")
             accept_all.setCursor(Qt.PointingHandCursor)
-            accept_all.setToolTip("把当前所有 @ 候选转入稍后处理")
+            accept_all.setToolTip("把当前所有 @ 候选转为待办事项")
             accept_all.clicked.connect(self.app.accept_all_mentions)
             mhead.addWidget(accept_all)
 
@@ -727,12 +727,12 @@ class QueueBubble(QWidget):
         pdot = QLabel("●")
         pdot.setStyleSheet("color:#cfcfcf; font-size:10px;")
         head.addWidget(pdot)
-        title = QLabel("稍后处理")
+        title = QLabel("待办事项")
         title.setObjectName("title")
         title.setFont(QFont("", 13))
         head.addWidget(title)
         head.addStretch(1)
-        cnt = QLabel(f"{len(pending)}" if pending else "清空啦～")
+        cnt = QLabel(f"{len(pending)}" if pending else "已为你清空")
         cnt.setObjectName("count")
         head.addWidget(cnt)
         hw = QWidget()
@@ -741,7 +741,7 @@ class QueueBubble(QWidget):
 
         # 任务行
         if not pending:
-            empty = QLabel("空啦，歇会儿")
+            empty = QLabel("当前没有待处理事项，我会继续替你留意。")
             empty.setStyleSheet("color:#b8b8b8;")
             self.vbox.addWidget(empty)
         else:
@@ -817,7 +817,7 @@ class QueueBubble(QWidget):
                 warn.setMaximumWidth(300)
                 self.vbox.addWidget(warn)
             elif st and st.get("at"):
-                okl = QLabel(f"上次检查 {st.get('at')}")
+                okl = QLabel(f"上次为你检查 {st.get('at')}")
                 okl.setObjectName("pollok")
                 self.vbox.addWidget(okl)
 
@@ -984,7 +984,7 @@ class QueueBubble(QWidget):
         accept = QPushButton("收下")
         accept.setObjectName("accept")
         accept.setCursor(Qt.PointingHandCursor)
-        accept.setToolTip("转入稍后处理")
+        accept.setToolTip("转为待办事项")
         accept.clicked.connect(lambda: self.app.accept_mention(key))
         btns.addWidget(accept, 1)
 
@@ -1099,7 +1099,7 @@ class GroupManagerDialog(QDialog):
         add.clicked.connect(self._on_add)
         btns.addWidget(add)
         btns.addStretch(1)
-        close = QPushButton("关闭")
+        close = QPushButton("知道了")
         close.clicked.connect(self.accept)
         btns.addWidget(close)
         bw = QWidget()
@@ -1143,7 +1143,7 @@ class ReminderManagerDialog(QDialog):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.setWindowTitle("定时提醒")
+        self.setWindowTitle("提醒事项")
         self.setMinimumWidth(340)
         self.setStyleSheet(DIALOG_QSS)
         self.vbox = QVBoxLayout(self)
@@ -1162,7 +1162,7 @@ class ReminderManagerDialog(QDialog):
         self._clear()
         reminders = sorted(self.app.reminders_all(), key=lambda r: r.get("time", ""))
         if not reminders:
-            hint = QLabel("还没有提醒，点下面「新增提醒」\n（比如每天 12:00 提醒吃饭）")
+            hint = QLabel("目前还没有提醒事项。\n你可以点击「新增提醒」，让我在合适的时间轻轻提醒你。")
             hint.setObjectName("hint")
             self.vbox.addWidget(hint)
         else:
@@ -1197,7 +1197,7 @@ class ReminderManagerDialog(QDialog):
         add.clicked.connect(self._add)
         btns.addWidget(add)
         btns.addStretch(1)
-        close = QPushButton("关闭")
+        close = QPushButton("稍后再说")
         close.clicked.connect(self.accept)
         btns.addWidget(close)
         bw = QWidget()
@@ -1646,7 +1646,7 @@ class Pet(QWidget):
         a_add = QAction("添加待办", self)
         a_add.triggered.connect(self.add_via_dialog)
         m.addAction(a_add)
-        a_remind = QAction("定时提醒", self)
+        a_remind = QAction("提醒事项", self)
         a_remind.triggered.connect(self.open_reminder_manager)
         m.addAction(a_remind)
         m.addSeparator()
@@ -1799,7 +1799,7 @@ class Pet(QWidget):
         return found
 
     def accept_mention(self, key):
-        """候选「收下」→ 转成正式的「稍后处理」任务，插到队列顶部。"""
+        """候选「收下」→ 转成正式的「待办事项」任务，插到队列顶部。"""
         c = self._pop_candidate(key)
         if c:
             summary = compact_text(c.get("content", ""))
@@ -1943,7 +1943,7 @@ class Pet(QWidget):
         self.refresh_ui()
 
     def open_reminder_manager(self):
-        """右键菜单「定时提醒…」：打开提醒管理弹窗。"""
+        """右键菜单「提醒事项…」：打开提醒管理弹窗。"""
         dlg = ReminderManagerDialog(self)
         dlg.adjustSize()
         center_on_pet_screen(dlg, self)
