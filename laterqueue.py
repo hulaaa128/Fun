@@ -667,11 +667,15 @@ class QueueBubble(QWidget):
         self.refresh()
 
     def refresh(self):
+        old_scroll = self.scroll.verticalScrollBar().value()
+
         # 清空
         while self.vbox.count():
             item = self.vbox.takeAt(0)
             w = item.widget()
             if w:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
         pending = self.app.pending()
@@ -817,15 +821,27 @@ class QueueBubble(QWidget):
                 okl.setObjectName("pollok")
                 self.vbox.addWidget(okl)
 
-        self._fit_content_to_screen()
+        self._finish_layout(old_scroll)
+
+    def _finish_layout(self, old_scroll=None):
+        """收尾布局：内容刚刷新时 Qt 可能还没算出 sizeHint，0 高度时先不覆盖旧尺寸。"""
+        if not self._fit_content_to_screen():
+            return
         self.card.adjustSize()
         self.adjustSize()
+        if old_scroll is not None:
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(min(old_scroll, bar.maximum()))
 
     def _fit_content_to_screen(self):
         """候选消息可能很多：限制面板高度，避免 Qt 为塞进屏幕压扁卡片。"""
-        self.content.adjustSize()
-        hint = self.content.sizeHint()
+        self.vbox.invalidate()
+        self.vbox.activate()
+        hint = self.vbox.sizeHint()
+        if hint.width() <= 0 or hint.height() <= 0:
+            return False
         self.content.setMinimumSize(hint)
+        self.content.resize(hint)
 
         screen = None
         if hasattr(self.app, "_screen_geo"):
@@ -845,6 +861,7 @@ class QueueBubble(QWidget):
         scrollbar_w = self.scroll.verticalScrollBar().sizeHint().width()
         scroll_w = hint.width() + (scrollbar_w if hint.height() > scroll_h else 0)
         self.scroll.setMinimumWidth(scroll_w)
+        return True
 
     def _toggle_done(self):
         self._show_done = not self._show_done
@@ -1990,8 +2007,13 @@ class Pet(QWidget):
         QTimer.singleShot(0, self._do_refresh)
 
     def _do_refresh(self):
-        # 只更新内容，不重新摆放气泡（否则每次点按钮气泡都会跳位置）
+        # 内容数量变化后必须重新布局和定位；否则删除待办后旧窗口区域会残留成白屏。
         self.bubble.refresh()
+        QApplication.processEvents()
+        self.bubble._finish_layout()
+        if self.bubble.isVisible():
+            self._place_bubble()
+            self.bubble.raise_()
         self.update_badge()
 
     def update_badge(self):
