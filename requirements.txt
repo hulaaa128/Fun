@@ -1,0 +1,6 @@
+# 运行/打包所需依赖
+# 只用到 QtCore/QtGui/QtWidgets，装 Essentials 即可（比完整版 PySide6 小很多）
+PySide6-Essentials>=6.5
+
+# 仅打包 .app 时需要
+py2app>=0.28

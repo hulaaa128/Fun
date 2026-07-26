@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# py2app 构建产物
+build/
+dist/
+
+# macOS
+.DS_Store
+
+# 运行时数据 / 日志
+*.log
+
+# 其它
+.claude/
