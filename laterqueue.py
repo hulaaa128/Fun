@@ -910,7 +910,7 @@ class QueueBubble(QWidget):
 
         lbl = QLabel(it["text"])
         lbl.setProperty("class", "task")
-        lbl.setFixedWidth(420)
+        lbl.setFixedWidth(260)
         lbl.setWordWrap(True)
         lbl.setToolTip(it["text"])
         lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
@@ -939,7 +939,7 @@ class QueueBubble(QWidget):
         w.setStyleSheet(
             "#taskcard { background:#f6f6f6; border-radius:14px; }")
         w.setLayout(row)
-        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        w.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
         w.setMinimumHeight(w.sizeHint().height())
         return w
 
