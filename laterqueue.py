@@ -62,6 +62,11 @@ FAIL_ALERT_THRESHOLD = 2
 DISMISSED_KEEP = 500               # dismissed_keys 最多保留条数，防无限增长
 DONE_KEEP_DAYS = 14                # 已完成记录保留天数：超期在加载时清掉，防 queue.json 无限增长
 DONE_SHOW_MAX = 15                 # 「最近完成」区最多列出条数
+
+# AI 智能待办（实验性）：用 Claude 从 @我消息抽取结构化待办 + 建议动作
+AI_ENABLED_KEY = "ai_extract_enabled"   # mentions.json 中存储开关状态的 key
+AI_MODEL = "claude-sonnet-4-20250514"
+AI_TIMEOUT = 30                         # Claude API 调用超时（秒）
 LAUNCH_AGENT_LABEL = "com.laterqueue.app"
 LAUNCH_AGENT_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist")
@@ -124,13 +129,17 @@ def save_items(items):
     os.replace(tmp, DATA_FILE)
 
 
-def new_item(text):
-    return {
+def new_item(text, action_type=None, action_params=None):
+    item = {
         "id": uuid.uuid4().hex,
         "text": text.strip(),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "status": "pending",
     }
+    if action_type and action_type != "none":
+        item["action_type"] = action_type
+        item["action_params"] = action_params or {}
+    return item
 
 
 def compact_text(text):
@@ -434,6 +443,97 @@ class MentionPoller(QObject):
                 "content": content,
             })
         return cands, latest
+
+
+# =========================== AI 待办抽取 ===========================
+
+_AI_EXTRACT_PROMPT = """\
+你是一个办公待办助手。下面是一组群聊中 @我 的消息，请将每条消息抽取为一个结构化待办。
+
+对每条消息输出：
+- todo_text: 一句话待办摘要（10-30字，动宾短语，如"回复张三关于部署问题"）
+- action_type: 建议动作类型，只能是以下之一：
+  - "reply" — 需要回复消息
+  - "meeting" — 需要建会/约时间
+  - "remind" — 需要设定时提醒
+  - "none" — 仅记录，无需特定动作
+- action_params: 动作参数对象
+  - reply: {"group_id": "...", "reply_points": "建议回复要点"}
+  - meeting: {"attendees": "建议参会人", "topic": "主题"}
+  - remind: {"time": "HH:MM", "text": "提醒内容"}
+  - none: {}
+
+输入消息格式为 JSON 数组，每项有 key, group_id, group_name, sender, content 字段。
+请直接输出 JSON 数组，不要有其他文字。每个输出项必须包含 key 字段（与输入对应）。
+"""
+
+
+class AIExtractor(QObject):
+    """在 worker 线程里调 Claude API 抽取 @我消息为结构化待办。"""
+
+    extracted = Signal(list)   # [{key, todo_text, action_type, action_params}]
+    finished = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.candidates = []   # 主线程注入
+
+    def extract(self):
+        try:
+            results = self._call_claude()
+        except Exception as e:
+            sys.stderr.write(f"[ai] extract failed: {e}\n")
+            results = []
+        self.extracted.emit(results)
+        self.finished.emit()
+
+    def _call_claude(self):
+        import anthropic
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if not api_key:
+            return []
+        kwargs = {"api_key": api_key, "timeout": AI_TIMEOUT}
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = anthropic.Anthropic(**kwargs)
+        model = os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL") or AI_MODEL
+        msgs_input = [
+            {"key": c["key"], "group_id": c["group_id"],
+             "group_name": c.get("group_name", ""), "sender": c.get("sender", ""),
+             "content": c.get("content", "")}
+            for c in self.candidates
+        ]
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user",
+                       "content": _AI_EXTRACT_PROMPT + "\n\n" + json.dumps(
+                           msgs_input, ensure_ascii=False)}],
+        )
+        text = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                text = block.text.strip()
+                break
+        if not text:
+            return []
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            return []
+        valid = []
+        for item in parsed:
+            if not isinstance(item, dict) or "key" not in item:
+                continue
+            valid.append({
+                "key": item["key"],
+                "todo_text": item.get("todo_text", ""),
+                "action_type": item.get("action_type", "none"),
+                "action_params": item.get("action_params", {}),
+            })
+        return valid
 
 
 # =========================== 统一弹窗 ===========================
@@ -900,6 +1000,16 @@ class QueueBubble(QWidget):
         lbl.setMinimumHeight(lbl.sizeHint().height())
         row.addWidget(lbl, 1, Qt.AlignVCenter)
 
+        # AI 建议动作：可一键执行（回复/提醒）
+        if it.get("action_type") and it["action_type"] != "none":
+            exe = QPushButton("▶")
+            exe.setFixedSize(22, 22)
+            exe.setCursor(Qt.PointingHandCursor)
+            exe.setToolTip("执行")
+            exe.setStyleSheet("color:#5aa469; font-size:14px; border:none;")
+            exe.clicked.connect(lambda: self.app.execute_action(it["id"]))
+            row.addWidget(exe)
+
         # 置顶：灰色胶囊标签
         up = QPushButton("置顶")
         up.setCursor(Qt.PointingHandCursor)
@@ -930,11 +1040,14 @@ class QueueBubble(QWidget):
         """一条被@候选：灰底圆角卡片。首行「发送人 · 群名右对齐」，
         中间 @ 内容，底部「收下」(黑) + 「忽略」(白描边)。贴 JoyChat 参考图。"""
         key = c.get("key")
+        ai_todo = c.get("ai_todo")
+        ai_action = c.get("ai_action", {})
+        action_type = ai_action.get("action_type", "none") if ai_action else "none"
         box = QVBoxLayout()
         box.setSpacing(8)
         box.setContentsMargins(12, 11, 12, 11)
 
-        # 首行：发送人（左）+ 群名（右，淡色）
+        # 首行：发送人（左）+ AI 动作标签 + 群名（右，淡色）
         top = QHBoxLayout()
         top.setSpacing(6)
         top.setContentsMargins(0, 0, 0, 0)
@@ -942,6 +1055,14 @@ class QueueBubble(QWidget):
         who.setProperty("class", "mfrom")
         who.setMaximumWidth(160)
         top.addWidget(who)
+        if ai_todo and action_type != "none":
+            ACTION_LABELS = {"reply": "回复", "meeting": "建会", "remind": "提醒"}
+            tag = QPushButton(ACTION_LABELS.get(action_type, action_type))
+            tag.setStyleSheet(
+                "font-size:11px; color:#5aa469; border:1px solid #5aa469; "
+                "border-radius:8px; padding:1px 6px;")
+            tag.setEnabled(False)
+            top.addWidget(tag)
         top.addStretch(1)
         grp = QLabel(c.get("group_name", ""))
         grp.setObjectName("count")
@@ -951,9 +1072,13 @@ class QueueBubble(QWidget):
         tw.setLayout(top)
         box.addWidget(tw)
 
-        # @ 内容正文：候选区本身可滚动，这里展示全文，不提前截断。
-        body = QLabel(compact_text(c.get("content", "")))
-        body.setProperty("class", "mbody")
+        # @ 内容正文：有 AI 摘要时优先显示摘要，否则展示原文（候选区可滚动，不提前截断）。
+        if ai_todo:
+            body = QLabel(ai_todo)
+            body.setStyleSheet("color:#33302b; font-weight:500;")
+        else:
+            body = QLabel(compact_text(c.get("content", "")))
+            body.setProperty("class", "mbody")
         body.setFixedWidth(280)
         body.setWordWrap(True)
         body.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
@@ -1393,6 +1518,8 @@ class Pet(QWidget):
         # poller 在独立 QThread 里跑阻塞的 joyctl（约 14 秒），完成后用信号回主线程。
         self._poll_thread = None
         self._poller = None
+        self._ai_thread = None
+        self._ai_extractor = None
         self._checking = False   # 「立即检查」进行中标志，供面板显示「检查中…」
         self._poll_timer = QTimer(self)
         # 注意：QTimer.timeout 会给槽传一个 bool，会污染 _start_poll(manual)，
@@ -1646,6 +1773,10 @@ class Pet(QWidget):
         self.a_launch.setChecked(launch_at_login_enabled())
         self.a_launch.triggered.connect(self.toggle_launch)
         m.addAction(self.a_launch)
+        self.a_ai = QAction("AI 智能待办（实验）", self, checkable=True)
+        self.a_ai.setChecked(self.ai_enabled())
+        self.a_ai.triggered.connect(self._toggle_ai)
+        m.addAction(self.a_ai)
         m.addSeparator()
         a_quit = QAction("退出", self)
         a_quit.triggered.connect(QApplication.quit)
@@ -1699,6 +1830,73 @@ class Pet(QWidget):
         self.items = [it for it in self.items if it["status"] != "done"]
         save_items(self.items)
         self.refresh_ui()
+
+    # ---------- AI 建议动作执行 ----------
+    def execute_action(self, item_id):
+        """执行待办关联的动作（reply/remind）。"""
+        it = next((i for i in self.items if i["id"] == item_id), None)
+        if not it:
+            return
+        action_type = it.get("action_type")
+        params = it.get("action_params", {})
+        if action_type == "reply":
+            self._execute_reply(it, params)
+        elif action_type == "remind":
+            self._execute_remind(it, params)
+        elif action_type == "meeting":
+            self._toast("建会功能暂不支持自动执行，请手动操作")
+        else:
+            self._toast("该待办没有可执行的动作")
+
+    def _execute_reply(self, it, params):
+        """执行回复动作：让用户确认/编辑回复内容后发送。"""
+        group_id = params.get("group_id", "")
+        reply_points = params.get("reply_points", "")
+        if not group_id:
+            self._toast("缺少群 ID，无法回复")
+            return
+        text = SimpleInputDialog.get_text(
+            self, "回复消息",
+            f"回复到群（建议要点：{reply_points}）：",
+            text=reply_points)
+        if not text or not text.strip():
+            return
+        joyctl = _resolve_joyctl()
+        if not joyctl:
+            self._toast("joyctl 未安装，无法发送")
+            return
+        try:
+            cmd = [joyctl, "chat", "send", "group",
+                   "--group-id", str(group_id), "--content", text.strip()]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                self.mark_done(it["id"])
+                self._toast("已发送")
+            else:
+                self._toast(f"发送失败：{(proc.stderr or '').strip()[:80]}")
+        except Exception as e:
+            self._toast(f"发送异常：{e}")
+
+    def _execute_remind(self, it, params):
+        """执行提醒动作：创建定时提醒。"""
+        time_str = params.get("time", "")
+        text = params.get("text", it.get("text", ""))
+        if not time_str:
+            time_str = SimpleInputDialog.get_text(
+                self, "设置提醒时间", "提醒时间（HH:MM）：")
+            if not time_str or not time_str.strip():
+                return
+        self.add_reminder(time_str.strip(), text)
+        self.mark_done(it["id"])
+        self._toast(f"已设定 {time_str} 提醒")
+
+    # ---------- AI 智能待办 ----------
+    def ai_enabled(self):
+        return bool(self.mentions.get(AI_ENABLED_KEY, False))
+
+    def _toggle_ai(self, checked):
+        self.mentions[AI_ENABLED_KEY] = checked
+        save_mentions(self.mentions)
 
     # ---------- 被@候选操作 ----------
     def candidates(self):
@@ -1782,12 +1980,22 @@ class Pet(QWidget):
         return found
 
     def accept_mention(self, key):
-        """候选「收下」→ 转成正式的「稍后处理」任务，插到队列顶部。"""
+        """候选「收下」→ 转成正式的「稍后处理」任务，插到队列顶部。
+        如果 AI 已抽取出结构化信息，则使用 AI 摘要和动作类型。"""
         c = self._pop_candidate(key)
         if c:
-            summary = compact_text(c.get("content", ""))
-            text = f"{c.get('sender', '?')}@我·{c.get('group_name', '')}：{summary}"
-            self.items.insert(0, new_item(text))
+            ai_todo = c.get("ai_todo")
+            ai_action = c.get("ai_action")
+            if ai_todo:
+                text = ai_todo
+                action_type = ai_action.get("action_type") if ai_action else None
+                action_params = ai_action.get("action_params") if ai_action else None
+            else:
+                summary = compact_text(c.get("content", ""))
+                text = f"{c.get('sender', '?')}@我·{c.get('group_name', '')}：{summary}"
+                action_type = None
+                action_params = None
+            self.items.insert(0, new_item(text, action_type, action_params))
             save_items(self.items)
             self._dismiss_key(key)
             save_mentions(self.mentions)
@@ -1802,9 +2010,18 @@ class Pet(QWidget):
 
         new_items = []
         for c in cands:
-            summary = compact_text(c.get("content", ""))
-            text = f"{c.get('sender', '?')}@我·{c.get('group_name', '')}：{summary}"
-            new_items.append(new_item(text))
+            ai_todo = c.get("ai_todo")
+            ai_action = c.get("ai_action")
+            if ai_todo:
+                text = ai_todo
+                action_type = ai_action.get("action_type") if ai_action else None
+                action_params = ai_action.get("action_params") if ai_action else None
+            else:
+                summary = compact_text(c.get("content", ""))
+                text = f"{c.get('sender', '?')}@我·{c.get('group_name', '')}：{summary}"
+                action_type = None
+                action_params = None
+            new_items.append(new_item(text, action_type, action_params))
             self._dismiss_key(c.get("key"))
 
         self.items[0:0] = new_items
@@ -1913,7 +2130,52 @@ class Pet(QWidget):
         save_mentions(self.mentions)
         if new_candidates:
             self._bounce()   # 有新的被@，跳一下提示
+            if self.ai_enabled() and (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+                self._start_ai_extract(new_candidates)
         self.refresh_ui()
+
+    # ---------- AI 抽取 ----------
+    def _start_ai_extract(self, candidates):
+        """启动 AI 线程抽取新 candidates 的结构化待办。"""
+        if getattr(self, "_ai_thread", None) is not None:
+            return
+        thread = QThread(self)
+        extractor = AIExtractor()
+        extractor.candidates = candidates
+        extractor.moveToThread(thread)
+        thread.started.connect(extractor.extract)
+        extractor.extracted.connect(self._on_ai_extracted)
+        extractor.finished.connect(thread.quit)
+        thread.finished.connect(extractor.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_ai_finished)
+        self._ai_thread = thread
+        self._ai_extractor = extractor
+        thread.start()
+
+    def _on_ai_extracted(self, results):
+        """AI 返回结构化结果，更新对应 candidate 字段。"""
+        if not results:
+            return
+        result_map = {r["key"]: r for r in results}
+        cands = self.mentions.get("candidates", [])
+        changed = False
+        for c in cands:
+            r = result_map.get(c.get("key"))
+            if r:
+                c["ai_todo"] = r.get("todo_text", "")
+                c["ai_action"] = {
+                    "action_type": r.get("action_type", "none"),
+                    "action_params": r.get("action_params", {}),
+                }
+                changed = True
+        if changed:
+            save_mentions(self.mentions)
+            self.refresh_ui()
+
+    def _on_ai_finished(self):
+        self._ai_thread = None
+        self._ai_extractor = None
 
     # ---------- 监控群管理 ----------
     def open_group_manager(self):
@@ -2066,7 +2328,13 @@ class Pet(QWidget):
         st = load_state()
         screen = QApplication.primaryScreen().availableGeometry()
         if "x" in st and "y" in st:
-            self.move(int(st["x"]), int(st["y"]))
+            x, y = int(st["x"]), int(st["y"])
+            # 存的坐标可能落在已拔掉的外接屏上：中心点不在当前屏内就回落到默认角落
+            if screen.contains(QPoint(x + self.width() // 2, y + self.height() // 2)):
+                self.move(x, y)
+            else:
+                self.move(screen.right() - self.width() - 40,
+                          screen.bottom() - self.height() - 40)
         else:
             self.move(screen.right() - self.width() - 40,
                       screen.bottom() - self.height() - 40)

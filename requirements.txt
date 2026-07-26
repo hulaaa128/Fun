@@ -2,5 +2,8 @@
 # 只用到 QtCore/QtGui/QtWidgets，装 Essentials 即可（比完整版 PySide6 小很多）
 PySide6-Essentials>=6.5
 
+# AI 智能待办（实验性）：从 @我消息抽取结构化待办
+anthropic>=0.40.0
+
 # 仅打包 .app 时需要
 py2app>=0.28
