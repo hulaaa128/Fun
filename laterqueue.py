@@ -2141,6 +2141,13 @@ class Pet(QWidget):
             self._bounce()         # 点一下先跳一下
             self.toggle_bubble()   # 没拖动 = 单击，展开/收起队列
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton and self._is_pet_hit(e.position().toPoint()):
+            self._click_candidate = False
+            self._menu.exec(e.globalPosition().toPoint())
+            return
+        e.ignore()
+
     def moveEvent(self, e):
         super().moveEvent(e)
         if getattr(self, "_ready", False):
