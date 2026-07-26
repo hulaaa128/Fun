@@ -1481,6 +1481,22 @@ class Pet(QWidget):
             p.drawText(QRectF(bx, by, d, d), Qt.AlignCenter, txt)
         p.end()
 
+    def _is_pet_hit(self, pos):
+        """只让小人可见像素响应点击，避免透明留白误唤起面板。"""
+        pm = self._pix_blink if self._blinking else self._pix_open
+        if pm is None or pm.isNull() or self._pet_rect.isEmpty():
+            return False
+        point = QPointF(pos)
+        if not self._pet_rect.contains(point):
+            return False
+
+        rx = (point.x() - self._pet_rect.x()) / max(1.0, self._pet_rect.width())
+        ry = (point.y() - self._pet_rect.y()) / max(1.0, self._pet_rect.height())
+        img = pm.toImage()
+        px = max(0, min(img.width() - 1, int(rx * img.width())))
+        py = max(0, min(img.height() - 1, int(ry * img.height())))
+        return img.pixelColor(px, py).alpha() > 20
+
     def _draw_hourglass(self, p):
         """在肚子的奶油圆底上画沙漏。按 _hg_phase/_hg_t 呈现漏沙，
         按 _hg_flip 呈现整体翻转（只翻沙漏，不动身体）。几何比例沿用
@@ -2096,6 +2112,10 @@ class Pet(QWidget):
 
     # ---------- 鼠标：系统级拖动 / 点击 / 右键 ----------
     def mousePressEvent(self, e):
+        if not self._is_pet_hit(e.position().toPoint()):
+            self._click_candidate = False
+            e.ignore()
+            return
         if e.button() == Qt.RightButton:
             self._menu.exec(e.globalPosition().toPoint())
             return
